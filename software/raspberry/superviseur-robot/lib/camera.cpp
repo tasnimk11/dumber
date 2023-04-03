@@ -106,6 +106,8 @@ Img Camera::Grab() {
     return capture;
 }
 
+
+
 /**
  * Get opening status for camera
  * @return true if camera is open, false otherwise

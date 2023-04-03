@@ -58,14 +58,18 @@ public:
      */
     void Join();
     
+   
 private:
     /**********************************************************************/
     /* Shared data                                                        */
     /**********************************************************************/
     ComMonitor monitor;
     ComRobot robot;
+    Camera * camera;
+    //Img img;
     int robotStarted = 0;
     int move = MESSAGE_ROBOT_STOP;
+    int cameraOpen = 0;
     
     /**********************************************************************/
     /* Tasks                                                              */
@@ -76,7 +80,9 @@ private:
     RT_TASK th_openComRobot;
     RT_TASK th_startRobot;
     RT_TASK th_move;
-    
+    RT_TASK th_levelBat;
+    RT_TASK th_manageCamera;
+    RT_TASK th_captureImage;
     /**********************************************************************/
     /* Mutex                                                              */
     /**********************************************************************/
@@ -84,6 +90,9 @@ private:
     RT_MUTEX mutex_robot;
     RT_MUTEX mutex_robotStarted;
     RT_MUTEX mutex_move;
+    RT_MUTEX mutex_levelBat;
+    RT_MUTEX mutex_cameraOpen;
+    RT_MUTEX mutex_camera;
 
     /**********************************************************************/
     /* Semaphores                                                         */
@@ -92,7 +101,9 @@ private:
     RT_SEM sem_openComRobot;
     RT_SEM sem_serverOk;
     RT_SEM sem_startRobot;
-
+    RT_SEM sem_manageCamera;
+    //RT_SEM sem_closeCamera;
+    
     /**********************************************************************/
     /* Message queues                                                     */
     /**********************************************************************/
@@ -148,6 +159,18 @@ private:
      * @return Message read
      */
     Message *ReadInQueue(RT_QUEUE *queue);
+    
+    /**
+    * @brief Thread handling battery level.
+    */
+    void LevelBat(void *arg);
+    
+    
+    void ManageCameraTask(void *arg);
+    
+    void CaptureImages(void *arg);
+    
+    
 
 };
 
