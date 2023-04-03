@@ -55,7 +55,7 @@ void Tasks::Init() {
     int status;
     int err;
 
-    /***************************th_lebelBat***********************************************************/
+    /**************************************************************************************/
     /* 	Mutex creation                                                                    */
     /**************************************************************************************/
     if (err = rt_mutex_create(&mutex_monitor, NULL)) {
@@ -79,6 +79,10 @@ void Tasks::Init() {
         exit(EXIT_FAILURE);
     }
     if (err = rt_mutex_create(&mutex_camera, NULL)) {
+        cerr << "Error mutex create: " << strerror(-err) << endl << flush;
+        exit(EXIT_FAILURE);
+    } 
+    if (err = rt_mutex_create(&mutex_watchdog, NULL)) {
         cerr << "Error mutex create: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
@@ -106,6 +110,10 @@ void Tasks::Init() {
     }
     
     if (err = rt_sem_create(&sem_manageCamera, NULL, 0, S_FIFO)) {
+        cerr << "Error semaphore create: " << strerror(-err) << endl << flush;
+        exit(EXIT_FAILURE);
+    }
+    if (err = rt_sem_create(&sem_watchdogStarted, NULL, 0, S_FIFO)) {
         cerr << "Error semaphore create: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
@@ -151,6 +159,10 @@ void Tasks::Init() {
         cerr << "Error task create: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
+    if (err = rt_task_create(&th_watchdog, "th_watchdog", 0, PRIORITY_TOPENCOMROBOT, 0)) {
+        cerr << "Error task create: " << strerror(-err) << endl << flush;
+        exit(EXIT_FAILURE);
+    }
     cout << "Tasks created successfully" << endl << flush;
 
     /**************************************************************************************/
@@ -161,6 +173,10 @@ void Tasks::Init() {
         exit(EXIT_FAILURE);
     }
     cout << "Queues created successfully" << endl << flush;
+    
+    /**************************************************************************************/
+    /* Initiate Camera                                                                    */
+    /**************************************************************************************/
     
     camera = new Camera(sm, 5);
 
@@ -209,7 +225,11 @@ void Tasks::Run() {
         cerr << "Error task start: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
-
+    if (err = rt_task_start(&th_watchdog, (void(*)(void*)) & Tasks::WatchdogTask, this)) {
+        cerr << "Error task start: " << strerror(-err) << endl << flush;
+        exit(EXIT_FAILURE);
+    }
+    
     cout << "Tasks launched" << endl << flush;
 }
 
@@ -307,6 +327,14 @@ void Tasks::ReceiveFromMonTask(void *arg) {
         } else if (msgRcv->CompareID(MESSAGE_ROBOT_COM_OPEN)) {
             rt_sem_v(&sem_openComRobot);
         } else if (msgRcv->CompareID(MESSAGE_ROBOT_START_WITHOUT_WD)) {
+            rt_mutex_acquire(&mutex_watchdog, TM_INFINITE);
+            wd = 0;
+            rt_mutex_release(&mutex_watchdog);
+            rt_sem_v(&sem_startRobot);
+        } else if (msgRcv->CompareID(MESSAGE_ROBOT_START_WITH_WD)) {           
+            rt_mutex_acquire(&mutex_watchdog, TM_INFINITE);
+            wd = 1;
+            rt_mutex_release(&mutex_watchdog);
             rt_sem_v(&sem_startRobot);
         } else if (msgRcv->CompareID(MESSAGE_ROBOT_GO_FORWARD) ||
                 msgRcv->CompareID(MESSAGE_ROBOT_GO_BACKWARD) ||
@@ -322,7 +350,7 @@ void Tasks::ReceiveFromMonTask(void *arg) {
          
         } else if (msgRcv->CompareID(MESSAGE_CAM_CLOSE)){
             rt_sem_v(&sem_manageCamera);
-        }
+        } 
         delete(msgRcv); // mus be deleted manually, no consumer
     }
 }
@@ -368,6 +396,8 @@ void Tasks::StartRobotTask(void *arg) {
     // Synchronization barrier (waiting that all tasks are starting)
     rt_sem_p(&sem_barrier, TM_INFINITE);
     
+    int w;
+    
     /**************************************************************************************/
     /* The task startRobot starts here                                                    */
     /**************************************************************************************/
@@ -375,13 +405,32 @@ void Tasks::StartRobotTask(void *arg) {
 
         Message * msgSend;
         rt_sem_p(&sem_startRobot, TM_INFINITE);
-        cout << "Start robot without watchdog (";
-        rt_mutex_acquire(&mutex_robot, TM_INFINITE);
-        msgSend = robot.Write(robot.StartWithoutWD());
-        rt_mutex_release(&mutex_robot);
-        cout << msgSend->GetID();
-        cout << ")" << endl;
+        
+        //WATCHDOG
+        rt_mutex_acquire(&mutex_watchdog, TM_INFINITE);
+        w = wd;
+        rt_mutex_release(&mutex_watchdog);
+        
+         if (w == 0){ // SANS WATCHDOG
+            cout << "Start robot without watchdog (";
+            rt_mutex_acquire(&mutex_robot, TM_INFINITE);
+            msgSend = robot.Write(robot.StartWithoutWD());
+            rt_mutex_release(&mutex_robot);
+            cout << msgSend->GetID();
+            cout << ")" << endl;
+            
+        } else if (w == 1){ //AVEC WATCHDOG
+            cout << "Start robot with watchdog (";
+            rt_mutex_acquire(&mutex_robot, TM_INFINITE);
+            msgSend = robot.Write(robot.StartWithWD());
+            rt_mutex_release(&mutex_robot);
+            cout << msgSend->GetID();
+            cout << ")" << endl;
+            rt_sem_v(&sem_watchdogStarted);
+        }
 
+        
+        //MOUVEMENT
         cout << "Movement answer: " << msgSend->ToString() << endl << flush;
         WriteInQueue(&q_messageToMon, msgSend);  // msgSend will be deleted by sendToMon
 
@@ -390,6 +439,8 @@ void Tasks::StartRobotTask(void *arg) {
             robotStarted = 1;
             rt_mutex_release(&mutex_robotStarted);
         }
+        
+       
     }
 }
 
@@ -431,7 +482,10 @@ void Tasks::MoveTask(void *arg) {
 }
 
 /**
-* @brief Thread handling battery level.
+ * @brief Thread handling battery level.
+ *          get and display battery level
+ * 
+ * @param arg
 */
 void Tasks::LevelBat(void *arg) {
     int rs;
@@ -459,9 +513,6 @@ void Tasks::LevelBat(void *arg) {
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
             levelBat = robot.Write(robot.GetBattery());
             rt_mutex_release(&mutex_robot);
-            
-            //cout << " lvl_bat = " << levelBat.ToString() << endl << flush;
-            
             WriteInQueue(&q_messageToMon, levelBat);
             
         }
@@ -471,7 +522,9 @@ void Tasks::LevelBat(void *arg) {
 }
 
 /**
- * 
+ * @brief Thread managing camera
+ *            open camera
+ *            close camera
  * @param arg
  */
 
@@ -488,26 +541,8 @@ void Tasks::ManageCameraTask (void *arg) {
     /* The task OpPRIORITY_TCAMERAenCameraTask starts here                                                  */
     /**************************************************************************************/
 
-        
-        //OPEN Camera FIRST TIME
-    /*    rt_sem_p(&sem_manageCamera, TM_INFINITE);
-        rt_mutex_acquire(&mutex_camera, TM_INFINITE);
-        status = camera->Open();
-        rt_mutex_release(&mutex_camera);
-        if (!status ) {
-            msgSend = new Message(MESSAGE_ANSWER_NACK);
-            rt_mutex_acquire(&mutex_cameraOpen, TM_INFINITE);
-            cameraOpen = 0;
-            rt_mutex_acquire(&mutex_cameraOpen, TM_INFINITE);
-        } else {
-            rt_mutex_acquire(&mutex_cameraOpen, TM_INFINITE);
-            cameraOpen = 1;
-            rt_mutex_release(&mutex_cameraOpen);
-        }*/
     while (1) {
         //OPEN Camera FIRST TIME
-
-
         rt_sem_p(&sem_manageCamera, TM_INFINITE);
         cout << "asked to open camera" << endl <<flush;
 
@@ -541,13 +576,6 @@ void Tasks::ManageCameraTask (void *arg) {
 
         cout << "camera closed" << endl <<flush;
 
-     
-        //OPEN
-        /*rt_sem_p(&sem_manageCamera, TM_INFINITE);
-        rt_mutex_acquire(&mutex_cameraOpen, TM_INFINITE);
-        cameraOpen = 1;
-        rt_mutex_release(&mutex_cameraOpen);*/
-        
     }
         
         
@@ -556,8 +584,6 @@ void Tasks::ManageCameraTask (void *arg) {
 
 
 void Tasks::CaptureImages(void *arg){
-    
-    
     int co;
     
     cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
@@ -577,7 +603,7 @@ void Tasks::CaptureImages(void *arg){
         co = cameraOpen;
         rt_mutex_release(&mutex_cameraOpen);
         
-        if (co == 1) { // cOpen Camera
+        if (co == 1) { // Open Camera
             rt_mutex_acquire(&mutex_camera, TM_INFINITE);
             img = new Img(camera->Grab());
             rt_mutex_release(&mutex_camera);
@@ -590,6 +616,41 @@ void Tasks::CaptureImages(void *arg){
         
     } 
 
+    
+}
+
+
+void Tasks::WatchdogTask(void *arg){
+    int rs;
+    Message *msg;
+    
+    rt_sem_p(&sem_barrier, TM_INFINITE);
+    cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
+    rt_sem_p(&sem_watchdogStarted, TM_INFINITE);
+
+    /**************************WatchdogTask************************************************************/
+    /* The task starts here                                                               */
+    /**************************************************************************************/
+    rt_task_set_periodic(NULL, TM_NOW, 1000000000); // freq=1 GHz, peridoe = 1s
+     
+    while (1) {
+        rt_task_wait_period(NULL);
+        cout << "Periodic watchdog update";
+        rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
+        rs = robotStarted;
+        rt_mutex_release(&mutex_robotStarted);
+        
+        if (rs == 1) {
+            rt_mutex_acquire(&mutex_robot, TM_INFINITE);
+            msg = robot.Write(new Message(MESSAGE_ROBOT_RELOAD_WD));
+            rt_mutex_release(&mutex_robot);
+            WriteInQueue(&q_messageToMon, msg);
+            cout << "WATCHDOG MODE" << endl <<flush;
+           
+        }
+        cout << endl << flush;
+        
+    } 
     
 }
 
