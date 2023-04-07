@@ -69,7 +69,9 @@ private:
     int robotStarted = 0;
     int move = MESSAGE_ROBOT_STOP;
     int cameraOpen = 0;
+    int captureImageOn = 0;
     int wd = 0;
+    int errCounter=0;
     
     /**********************************************************************/
     /* Tasks                                                              */
@@ -84,6 +86,7 @@ private:
     RT_TASK th_manageCamera;
     RT_TASK th_captureImage;
     RT_TASK th_watchdog;
+    
     /**********************************************************************/
     /* Mutex                                                              */
     /**********************************************************************/
@@ -94,6 +97,7 @@ private:
     RT_MUTEX mutex_levelBat;
     RT_MUTEX mutex_cameraOpen;
     RT_MUTEX mutex_camera;
+    RT_MUTEX mutex_captureImageOn;
     RT_MUTEX mutex_watchdog;
 
     /**********************************************************************/
@@ -145,6 +149,7 @@ private:
      */
     void MoveTask(void *arg);
     
+  
     /**********************************************************************/
     /* Queue services                                                     */
     /**********************************************************************/
@@ -173,6 +178,9 @@ private:
     void CaptureImages(void *arg);
     
     void WatchdogTask(void *arg);
+    
+    void TestErrMsgRobotSuper(Message * msg);
+    
 
 };
 

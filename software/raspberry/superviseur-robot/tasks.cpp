@@ -86,6 +86,10 @@ void Tasks::Init() {
         cerr << "Error mutex create: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
+    if (err = rt_mutex_create(&mutex_captureImageOn, NULL)) {
+        cerr << "Error mutex create: " << strerror(-err) << endl << flush;
+        exit(EXIT_FAILURE);
+    }
     
     cout << "Mutexes created successfully" << endl << flush;
 
@@ -163,6 +167,7 @@ void Tasks::Init() {
         cerr << "Error task create: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
+    
     cout << "Tasks created successfully" << endl << flush;
 
     /**************************************************************************************/
@@ -229,6 +234,7 @@ void Tasks::Run() {
         cerr << "Error task start: " << strerror(-err) << endl << flush;
         exit(EXIT_FAILURE);
     }
+    
     
     cout << "Tasks launched" << endl << flush;
 }
@@ -350,8 +356,10 @@ void Tasks::ReceiveFromMonTask(void *arg) {
          
         } else if (msgRcv->CompareID(MESSAGE_CAM_CLOSE)){
             rt_sem_v(&sem_manageCamera);
+        } else if (msgRcv->CompareID(MESSAGE_CAM_ASK_ARENA)){
+            //TODO!
         } 
-        delete(msgRcv); // mus be deleted manually, no consumer
+        delete(msgRcv); // must be deleted manually, no consumer
     }
 }
 
@@ -375,12 +383,15 @@ void Tasks::OpenComRobot(void *arg) {
         rt_mutex_acquire(&mutex_robot, TM_INFINITE);
         status = robot.Open();
         rt_mutex_release(&mutex_robot);
+       
+        
         cout << status;
         cout << ")" << endl << flush;
 
         Message * msgSend;
         if (status < 0) {
             msgSend = new Message(MESSAGE_ANSWER_NACK);
+            
         } else {
             msgSend = new Message(MESSAGE_ANSWER_ACK);
         }
@@ -416,6 +427,9 @@ void Tasks::StartRobotTask(void *arg) {
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
             msgSend = robot.Write(robot.StartWithoutWD());
             rt_mutex_release(&mutex_robot);
+            
+            TestErrMsgRobotSuper(msgSend); //ERROR COUNTER
+            
             cout << msgSend->GetID();
             cout << ")" << endl;
             
@@ -424,6 +438,9 @@ void Tasks::StartRobotTask(void *arg) {
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
             msgSend = robot.Write(robot.StartWithWD());
             rt_mutex_release(&mutex_robot);
+            
+            TestErrMsgRobotSuper(msgSend); //ERROR COUNTER
+            
             cout << msgSend->GetID();
             cout << ")" << endl;
             rt_sem_v(&sem_watchdogStarted);
@@ -444,12 +461,61 @@ void Tasks::StartRobotTask(void *arg) {
     }
 }
 
+
+
+
+/**
+ * @brief updates the error counter according to message : +1 if error, else reinit 
+ * @param msg
+ */
+
+void Tasks::TestErrMsgRobotSuper(Message * msg){
+    
+    bool close_com = false;
+    
+    cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
+    
+    int test = msg->CompareID(MESSAGE_ANSWER_NACK)  
+             || msg->CompareID(MESSAGE_ANSWER_ROBOT_TIMEOUT)
+             || msg->CompareID(MESSAGE_ANSWER_ROBOT_ERROR)
+             || msg->CompareID(MESSAGE_ANSWER_ROBOT_UNKNOWN_COMMAND)
+             || msg->CompareID(MESSAGE_ANSWER_COM_ERROR);
+    
+    if (test) {    //error detected    
+        errCounter++;
+        cout << "ERROR COUNTER :" << errCounter << endl << flush;
+        
+        if (errCounter == 3) {//verify if accumulates 3 errors 
+            close_com = true; //tolerate closing
+        }
+    } else {
+        errCounter=0; //reinitialize counter
+    }
+    
+    
+    if (close_com) {//has to close robot
+        rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
+        robotStarted = 0; 
+        rt_mutex_release(&mutex_robotStarted);
+        
+        rt_mutex_acquire(&mutex_robot, TM_INFINITE);
+        robot.Close(); 
+        rt_mutex_release(&mutex_robot);
+        
+        errCounter=0;
+    }
+    
+
+};
+
+
 /**
  * @brief Thread handling control of the robot.
  */
 void Tasks::MoveTask(void *arg) {
     int rs;
     int cpMove;
+    Message *msg;
     
     cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
     // Synchronization barrier (waiting that all tasks are starting)
@@ -474,16 +540,21 @@ void Tasks::MoveTask(void *arg) {
             cout << " move: " << cpMove;
             
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
-            robot.Write(new Message((MessageID)cpMove));
+            msg=robot.Write(new Message((MessageID)cpMove));
             rt_mutex_release(&mutex_robot);
+            
+            TestErrMsgRobotSuper(msg); //ERROR COUNTER
         }
         cout << endl << flush;
     }
 }
 
+
+
 /**
  * @brief Thread handling battery level.
- *          get and display battery level
+ *         get battery level from Robot
+ *         send battery level to monitor
  * 
  * @param arg
 */
@@ -513,6 +584,10 @@ void Tasks::LevelBat(void *arg) {
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
             levelBat = robot.Write(robot.GetBattery());
             rt_mutex_release(&mutex_robot);
+            
+            TestErrMsgRobotSuper(levelBat); //ERROR COUNTER
+            
+            
             WriteInQueue(&q_messageToMon, levelBat);
             
         }
@@ -523,8 +598,8 @@ void Tasks::LevelBat(void *arg) {
 
 /**
  * @brief Thread managing camera
- *            open camera
- *            close camera
+ *            Opens camera
+ *            Closes camera
  * @param arg
  */
 
@@ -578,13 +653,21 @@ void Tasks::ManageCameraTask (void *arg) {
 
     }
         
-        
+  
+    
+    
        
 }
 
-
+/**
+ * @brief     captures images from camera
+ *            sends images to monitor
+ * 
+ * 
+ * @param arg
+ */
 void Tasks::CaptureImages(void *arg){
-    int co;
+    int co,ci;
     
     cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
     
@@ -600,10 +683,14 @@ void Tasks::CaptureImages(void *arg){
         cout << "Periodic CamCapture ";
         
         rt_mutex_acquire(&mutex_cameraOpen, TM_INFINITE);
-        co = cameraOpen;
+        co = cameraOpen; //reads if the camera is open
         rt_mutex_release(&mutex_cameraOpen);
         
-        if (co == 1) { // Open Camera
+        rt_mutex_acquire(&mutex_captureImageOn, TM_INFINITE);
+        ci = captureImageOn; //reads if the authorized to capture images
+        rt_mutex_release(&mutex_captureImageOn);
+        
+        if (co == 1 && ci ==1) { // Open Camera + authorized to capture image
             rt_mutex_acquire(&mutex_camera, TM_INFINITE);
             img = new Img(camera->Grab());
             rt_mutex_release(&mutex_camera);
@@ -615,23 +702,31 @@ void Tasks::CaptureImages(void *arg){
         cout << endl << flush;
         
     } 
-
     
 }
 
+
+
+/**
+ * @brief Thread handaling Watchdog
+ *              
+ * 
+ * @param arg
+ */
 
 void Tasks::WatchdogTask(void *arg){
     int rs;
     Message *msg;
     
+    
     rt_sem_p(&sem_barrier, TM_INFINITE);
     cout << "Start " << __PRETTY_FUNCTION__ << endl << flush;
     rt_sem_p(&sem_watchdogStarted, TM_INFINITE);
 
-    /**************************WatchdogTask************************************************************/
+    /**************************WatchdogTask************************************************/
     /* The task starts here                                                               */
     /**************************************************************************************/
-    rt_task_set_periodic(NULL, TM_NOW, 1000000000); // freq=1 GHz, peridoe = 1s
+    rt_task_set_periodic(NULL, TM_NOW, 1000000000); // freq=1 GHz, peridoe = 100ms
      
     while (1) {
         rt_task_wait_period(NULL);
@@ -644,6 +739,9 @@ void Tasks::WatchdogTask(void *arg){
             rt_mutex_acquire(&mutex_robot, TM_INFINITE);
             msg = robot.Write(new Message(MESSAGE_ROBOT_RELOAD_WD));
             rt_mutex_release(&mutex_robot);
+            
+            TestErrMsgRobotSuper(msg); //ERROR COUNTER
+            
             WriteInQueue(&q_messageToMon, msg);
             cout << "WATCHDOG MODE" << endl <<flush;
            
@@ -653,7 +751,6 @@ void Tasks::WatchdogTask(void *arg){
     } 
     
 }
-
 
 
 /**
